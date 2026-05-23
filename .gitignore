@@ -1,0 +1,9 @@
+output/
+*.xlsx
+*.csv
+*.log
+*.json
+*.html
+Reports/
+CSV/
+.vscode/
