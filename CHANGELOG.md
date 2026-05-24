@@ -6,6 +6,41 @@ Il formato segue [Keep a Changelog](https://keepachangelog.com/it/1.0.0/).
 
 ---
 
+## [2.5] - 2026-05-24
+
+### Aggiunto
+
+- **`Get-AuthenticationThreatAnalysis`**: nuova funzione che analizza i sign-in log già raccolti da `Get-MgAuditLogSignIn` senza ulteriori chiamate a Graph. Produce 6 dataset distinti:
+  - **`Foreign_SignIns`**: tutti i login con `CountryOrRegion != IT`, con campo `Result` (Success/Failure), separati per analisi.
+  - **`Failed_Login_Analysis`**: tutte le autenticazioni fallite raggruppate per UPN, IP, Paese, App con conteggio totale fallimenti e campione di errori.
+  - **`Brute_Force_Candidates`**: utenti con ≥10 fallimenti in una finestra di 15 minuti — severità **High**.
+  - **`Password_Spray_Candidates`**: IP che tentano ≥5 utenti distinti nel periodo analizzato — severità **High**.
+  - **`Successful_After_Failures`**: utente con ≥2 fallimenti seguiti da login riuscito in 60 minuti — severità **Critical** se paese estero.
+  - **`Conditional_Access_NotApplied`**: eventi con `ConditionalAccessStatus = notApplied`, con login riusciti evidenziati.
+- **Campi `Country` e `City`** aggiunti all'output di `Get-SignInLogsData` (prima erano uniti nel campo `Location`). Non modifica la raccolta Graph esistente.
+- **Foglio Excel `Authentication Threats`** (ws13): riepilogo KPI minacce + 6 sezioni dettagliate con colorazione per severità (Critical = rosso, High = arancio, Medium = giallo, OK = verde). Il vecchio foglio Raw Data diventa ws14.
+- **Sezione HTML `Minacce di Autenticazione`**: 6 KPI card colorati dinamicamente (verde/giallo/arancio/rosso) nel report HTML esecutivo — mostra logins fuori Italia, gruppi fallimenti, IP sospetti, brute force, successi dopo fallimenti, CA notApplied.
+- **6 nuovi CSV** nella directory `CSV/`: `Foreign_SignIns.csv`, `Failed_Login_Analysis.csv`, `Brute_Force_Candidates.csv`, `Password_Spray_Candidates.csv`, `Successful_After_Failures.csv`, `Conditional_Access_NotApplied.csv`. Tutti sempre generati (anche vuoti con placeholder) per garantire la presenza nel workflow di post-processing.
+- **Helper interno `ConvertTo-SafeDateTime`** nella funzione di analisi per gestione robusta di `DateTime`/`DateTimeOffset` provenienti da Graph.
+
+### Modificato
+
+- **`Export-DataToCSV`**: aggiunto parametro `-ThreatData` e 6 nuove voci nel `$csvMap`. Tutti i 6 CSV threat aggiunti a `$alwaysExport` con messaggi placeholder specifici per tipo.
+- **`New-ExcelWorkbook`**: aggiunto parametro `-ThreatData` e nuovo foglio `Authentication Threats` (ws13). Il foglio `Raw Data` opzionale rinominato ws14 internamente.
+- **`New-HtmlReport`**: aggiunto parametro `-ThreatData` e nuova sezione `Minacce di Autenticazione` con 6 KPI card a colori dinamici.
+- **`Main`**: aggiunta chiamata a `Get-AuthenticationThreatAnalysis` nella Fase 3 (dopo `Get-LegacyAuthData`). Il risultato `$threatData` passato a `Export-DataToCSV`, `New-ExcelWorkbook` e `New-HtmlReport`.
+- **Versione**: aggiornata da `2.4` a `2.5`.
+
+### Invariato
+
+- Script 100% **read-only**: nessuna chiamata a `Set-`, `New-`, `Remove-`, `Update-` su servizi cloud.
+- `-SkipGraph`, `-SkipExchange` e `-SyntaxOnly` continuano a funzionare esattamente come prima. Se `-SkipGraph` è attivo, `$threatData` sarà `$null` e tutti i 6 CSV vengono generati vuoti senza errori.
+- Se non ci sono sign-in log (timeout, errore, zero eventi), `Get-AuthenticationThreatAnalysis` restituisce dataset vuoti e il processo continua senza interruzione.
+- Tutti i file di output pre-esistenti (Excel, Markdown, CSV legacy) mantengono struttura invariata.
+- Requisiti moduli invariati: `Microsoft.Graph >= 2.0`, `ExchangeOnlineManagement >= 3.0`, `ImportExcel >= 7.0`.
+
+---
+
 ## [2.4] - 2025-05-24
 
 ### Aggiunto
