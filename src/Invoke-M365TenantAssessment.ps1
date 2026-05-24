@@ -52,7 +52,7 @@
 
 .NOTES
     Autore: Security Assessment Script
-    Versione: 2.4
+    Versione: 2.5
     Requisiti: PowerShell 7+, Microsoft.Graph >= 2.0, ExchangeOnlineManagement >= 3.0,
                ImportExcel >= 7.0 (obbligatorio: carica EPPlus/OfficeOpenXml usato internamente)
     IMPORTANTE: Script read-only - non apporta modifiche al tenant.
@@ -105,7 +105,7 @@ if ([string]::IsNullOrEmpty($OutputPath)) {
 
 #region ─── COSTANTI E CONFIGURAZIONE ──────────────────────────────────────────
 
-$Script:AssessmentVersion        = "2.4"
+$Script:AssessmentVersion        = "2.5"
 $Script:StartTime                = Get-Date
 $Script:LogFile                  = $null
 $Script:OutputDir                = $null
@@ -521,6 +521,8 @@ function Get-SignInLogsData {
             @{N = "ClientAppUsed";          E = { $_.ClientAppUsed }},
             @{N = "IPAddress";              E = { $_.IpAddress }},
             @{N = "Location";               E = { if ($_.Location) { "$($_.Location.City), $($_.Location.CountryOrRegion)" } else { "N/A" } }},
+            @{N = "Country";                E = { if ($_.Location) { $_.Location.CountryOrRegion } else { "" } }},
+            @{N = "City";                   E = { if ($_.Location) { $_.Location.City } else { "" } }},
             @{N = "Status";                 E = { $_.Status.ErrorCode }},
             @{N = "StatusDetail";           E = { $_.Status.FailureReason }},
             @{N = "RiskLevel";              E = { $_.RiskLevelDuringSignIn }},
@@ -550,6 +552,240 @@ function Get-LegacyAuthData {
             IPAddress, Location, Status, CreatedDateTime, RiskLevel
     }
 }
+
+function Get-AuthenticationThreatAnalysis {
+    <#
+    .SYNOPSIS
+        Analizza i sign-in logs per rilevare minacce di autenticazione avanzate.
+    .DESCRIPTION
+        Genera 6 dataset: Foreign_SignIns, Failed_Login_Analysis, Brute_Force_Candidates,
+        Password_Spray_Candidates, Successful_After_Failures, Conditional_Access_NotApplied.
+        Non esegue chiamate Graph: lavora sui dati gia raccolti da Get-SignInLogsData.
+    .PARAMETER SignInLogs
+        Array di eventi sign-in gia processati da Get-SignInLogsData.
+    .OUTPUTS
+        Hashtable con 6 chiavi. Restituisce dataset vuoti se nessun log disponibile.
+    #>
+    param($SignInLogs)
+
+    $emptyResult = @{
+        ForeignSignIns          = @()
+        FailedLoginAnalysis     = @()
+        BruteForceCandidates    = @()
+        PasswordSprayCandidates = @()
+        SuccessfulAfterFailures = @()
+        CANotApplied            = @()
+    }
+
+    if (-not $SignInLogs -or @($SignInLogs).Count -eq 0) {
+        Write-Log "Authentication Threat Analysis: nessun sign-in log disponibile - dataset vuoti generati." "WARN"
+        return $emptyResult
+    }
+
+    Write-Log "Raccolta: Authentication Threat Analysis..." "INFO"
+    try {
+        [object[]]$logs = @($SignInLogs)
+        Write-Log "  Threat Analysis: $($logs.Count) eventi in analisi..." "INFO"
+
+        # Helper: converti CreatedDateTime in [datetime] in modo sicuro
+        function ConvertTo-SafeDateTime { param($v)
+            if ($v -is [datetime])       { return $v }
+            if ($v -is [datetimeoffset]) { return $v.UtcDateTime }
+            try { return [datetime]::Parse([string]$v, [System.Globalization.CultureInfo]::InvariantCulture) }
+            catch { return $null }
+        }
+
+        $allFailures = @($logs | Where-Object {
+            -not ($_.Status -eq 0 -or $_.Status -eq "0" -or [string]::IsNullOrEmpty([string]$_.Status))
+        })
+        $allSuccesses = @($logs | Where-Object {
+            $_.Status -eq 0 -or $_.Status -eq "0" -or [string]::IsNullOrEmpty([string]$_.Status)
+        })
+
+        # 1. FOREIGN SIGN-INS
+        Write-Log "  [1/6] Foreign Sign-Ins..." "INFO"
+        $foreignAll = @($logs | Where-Object {
+            $c = [string]$_.Country
+            $c -ne "" -and $c -ne "IT" -and $c -ne "Unknown" -and $c -ne "N/A"
+        } | Select-Object UPN, CreatedDateTime, IPAddress, Country, City,
+            AppDisplayName, ClientAppUsed,
+            @{N = "Result";     E = { if ($_.Status -eq 0 -or $_.Status -eq "0" -or [string]::IsNullOrEmpty([string]$_.Status)) { "Success" } else { "Failure" } }},
+            @{N = "StatusCode"; E = { $_.Status }},
+            ConditionalAccessStatus |
+            Sort-Object CreatedDateTime -Descending)
+
+        # 2. FAILED LOGIN ANALYSIS
+        Write-Log "  [2/6] Failed Login Analysis..." "INFO"
+        $failedDict = @{}
+        foreach ($f in $allFailures) {
+            $key = "$($f.UPN)|$($f.IPAddress)|$($f.Country)|$($f.AppDisplayName)"
+            if (-not $failedDict.ContainsKey($key)) {
+                $failedDict[$key] = [System.Collections.Generic.List[object]]::new()
+            }
+            [void]$failedDict[$key].Add($f)
+        }
+        $failedGroups = @($failedDict.GetEnumerator() | ForEach-Object {
+            $parts = $_.Key -split '\|', 4
+            $grp   = @($_.Value | Sort-Object CreatedDateTime)
+            [PSCustomObject]@{
+                UPN            = $parts[0]
+                IPAddress      = $parts[1]
+                Country        = $parts[2]
+                AppDisplayName = $parts[3]
+                FailureCount   = $grp.Count
+                FirstSeen      = ($grp | Select-Object -First 1).CreatedDateTime
+                LastSeen       = ($grp | Select-Object -Last 1).CreatedDateTime
+                SampleErrors   = (($grp | Select-Object -First 3 | ForEach-Object { $_.StatusDetail }) -join "; ")
+            }
+        } | Sort-Object FailureCount -Descending)
+
+        # 3. BRUTE FORCE CANDIDATES
+        Write-Log "  [3/6] Brute Force Candidates..." "INFO"
+        $bruteList   = [System.Collections.Generic.List[object]]::new()
+        $failsByUser = @{}
+        foreach ($f in $allFailures) {
+            if (-not $failsByUser.ContainsKey($f.UPN)) {
+                $failsByUser[$f.UPN] = [System.Collections.Generic.List[object]]::new()
+            }
+            [void]$failsByUser[$f.UPN].Add($f)
+        }
+        foreach ($upn in $failsByUser.Keys) {
+            $uFails = @($failsByUser[$upn] | Sort-Object CreatedDateTime)
+            for ($i = 0; $i -lt $uFails.Count; $i++) {
+                $wStart = ConvertTo-SafeDateTime $uFails[$i].CreatedDateTime
+                if ($null -eq $wStart) { continue }
+                $wEnd = $wStart.AddMinutes(15)
+                $inW  = @($uFails | Where-Object {
+                    $dt = ConvertTo-SafeDateTime $_.CreatedDateTime
+                    $null -ne $dt -and $dt -ge $wStart -and $dt -le $wEnd
+                })
+                if ($inW.Count -ge 10) {
+                    $bruteList.Add([PSCustomObject]@{
+                        UPN              = $upn
+                        FailuresInWindow = $inW.Count
+                        WindowStart      = $uFails[$i].CreatedDateTime
+                        WindowEnd        = $wEnd
+                        WindowMinutes    = 15
+                        IPAddresses      = (($inW | Select-Object -ExpandProperty IPAddress -Unique | Where-Object { $_ }) -join ", ")
+                        Countries        = (($inW | Select-Object -ExpandProperty Country -Unique | Where-Object { $_ }) -join ", ")
+                        Apps             = (($inW | Select-Object -ExpandProperty AppDisplayName -Unique | Where-Object { $_ }) -join ", ")
+                        Severity         = "High"
+                    })
+                    break
+                }
+            }
+        }
+        $bruteCandidates = @($bruteList | Sort-Object FailuresInWindow -Descending)
+
+        # 4. PASSWORD SPRAY CANDIDATES
+        Write-Log "  [4/6] Password Spray Candidates..." "INFO"
+        $sprayList = [System.Collections.Generic.List[object]]::new()
+        $failsByIP = @{}
+        foreach ($f in $allFailures) {
+            $ip = [string]$f.IPAddress
+            if ([string]::IsNullOrEmpty($ip)) { continue }
+            if (-not $failsByIP.ContainsKey($ip)) {
+                $failsByIP[$ip] = [System.Collections.Generic.List[object]]::new()
+            }
+            [void]$failsByIP[$ip].Add($f)
+        }
+        foreach ($ip in $failsByIP.Keys) {
+            $ipGrp    = @($failsByIP[$ip])
+            $distinct = @($ipGrp | Select-Object -ExpandProperty UPN -Unique | Where-Object { $_ })
+            if ($distinct.Count -ge 5) {
+                $sorted2 = $ipGrp | Sort-Object CreatedDateTime
+                $sprayList.Add([PSCustomObject]@{
+                    IPAddress     = $ip
+                    DistinctUsers = $distinct.Count
+                    TotalAttempts = $ipGrp.Count
+                    TargetUsers   = (($distinct | Select-Object -First 10) -join ", ")
+                    Countries     = (($ipGrp | Select-Object -ExpandProperty Country -Unique | Where-Object { $_ }) -join ", ")
+                    Apps          = (($ipGrp | Select-Object -ExpandProperty AppDisplayName -Unique | Where-Object { $_ }) -join ", ")
+                    FirstSeen     = ($sorted2 | Select-Object -First 1).CreatedDateTime
+                    LastSeen      = ($sorted2 | Select-Object -Last 1).CreatedDateTime
+                    Severity      = "High"
+                })
+            }
+        }
+        $sprayCandidates = @($sprayList | Sort-Object DistinctUsers -Descending)
+
+        # 5. SUCCESSFUL AFTER FAILURES
+        Write-Log "  [5/6] Successful After Failures..." "INFO"
+        $safList    = [System.Collections.Generic.List[object]]::new()
+        $logsByUser = @{}
+        foreach ($l in $logs) {
+            if (-not $logsByUser.ContainsKey($l.UPN)) {
+                $logsByUser[$l.UPN] = [System.Collections.Generic.List[object]]::new()
+            }
+            [void]$logsByUser[$l.UPN].Add($l)
+        }
+        foreach ($upn in $logsByUser.Keys) {
+            $uLogs   = @($logsByUser[$upn] | Sort-Object CreatedDateTime)
+            $uSucc   = @($uLogs | Where-Object { $_.Status -eq 0 -or $_.Status -eq "0" -or [string]::IsNullOrEmpty([string]$_.Status) })
+            $uFails2 = @($uLogs | Where-Object { -not ($_.Status -eq 0 -or $_.Status -eq "0" -or [string]::IsNullOrEmpty([string]$_.Status)) })
+            if ($uSucc.Count -eq 0 -or $uFails2.Count -eq 0) { continue }
+            $found = $false
+            foreach ($s in $uSucc) {
+                if ($found) { break }
+                $sTime = ConvertTo-SafeDateTime $s.CreatedDateTime
+                if ($null -eq $sTime) { continue }
+                $wBack = $sTime.AddMinutes(-60)
+                $prior = @($uFails2 | Where-Object {
+                    $dt = ConvertTo-SafeDateTime $_.CreatedDateTime
+                    $null -ne $dt -and $dt -ge $wBack -and $dt -lt $sTime
+                })
+                if ($prior.Count -ge 2) {
+                    $succCountry = [string]$s.Country
+                    $sev = if ($succCountry -ne "" -and $succCountry -ne "IT" -and $succCountry -ne "Unknown") { "Critical" } else { "High" }
+                    $safList.Add([PSCustomObject]@{
+                        UPN              = $upn
+                        SuccessDateTime  = $s.CreatedDateTime
+                        SuccessIP        = $s.IPAddress
+                        SuccessCountry   = $s.Country
+                        SuccessCity      = $s.City
+                        SuccessApp       = $s.AppDisplayName
+                        FailuresBefore   = $prior.Count
+                        FailureWindowMin = 60
+                        FirstFailure     = ($prior | Sort-Object CreatedDateTime | Select-Object -First 1).CreatedDateTime
+                        FailureIPs       = (($prior | Select-Object -ExpandProperty IPAddress -Unique | Where-Object { $_ }) -join ", ")
+                        Severity         = $sev
+                    })
+                    $found = $true
+                }
+            }
+        }
+        $safCandidates = @($safList | Sort-Object @{E = { if ($_.Severity -eq "Critical") { 0 } else { 1 } }}, SuccessDateTime -Descending)
+
+        # 6. CONDITIONAL ACCESS NOT APPLIED
+        Write-Log "  [6/6] Conditional Access NotApplied..." "INFO"
+        $caNotApplied = @($logs | Where-Object {
+            $_.ConditionalAccessStatus -eq "notApplied"
+        } | Select-Object UPN, CreatedDateTime, IPAddress, Country, City,
+            AppDisplayName, ClientAppUsed,
+            @{N = "Result";     E = { if ($_.Status -eq 0 -or $_.Status -eq "0" -or [string]::IsNullOrEmpty([string]$_.Status)) { "Success" } else { "Failure" } }},
+            @{N = "StatusCode"; E = { $_.Status }},
+            ConditionalAccessStatus |
+            Sort-Object Result, CreatedDateTime -Descending)
+
+        Write-Log ("  Threat Analysis: Foreign={0}, FailedGroups={1}, BruteForce={2}, Spray={3}, SAF={4}, CAnotApplied={5}" -f `
+            $foreignAll.Count, $failedGroups.Count, $bruteCandidates.Count,
+            $sprayCandidates.Count, $safCandidates.Count, $caNotApplied.Count) "SUCCESS"
+
+        return @{
+            ForeignSignIns          = $foreignAll
+            FailedLoginAnalysis     = $failedGroups
+            BruteForceCandidates    = $bruteCandidates
+            PasswordSprayCandidates = $sprayCandidates
+            SuccessfulAfterFailures = $safCandidates
+            CANotApplied            = $caNotApplied
+        }
+
+    } catch {
+        Write-Log "ERRORE in Authentication Threat Analysis: $($_.Exception.Message)" "ERROR"
+        return $emptyResult
+    }
+}
+
 
 function Get-TransportConfigData {
     return Invoke-SafeCollection -CollectionName "Transport Configuration EXO" -ScriptBlock {
@@ -1077,7 +1313,8 @@ function Export-DataToCSV {
         $OAuthData,
         $RiskyUsersData,
         $RiskDetectionsData,
-        $RulesData
+        $RulesData,
+        $ThreatData
     )
 
     Write-Section "EXPORT CSV"
@@ -1086,6 +1323,13 @@ function Export-DataToCSV {
     $rulesArr   = if ($RulesData -and $RulesData.ContainsKey("Rules"))      { $RulesData["Rules"] }      else { $null }
     $fwdArr     = if ($RulesData -and $RulesData.ContainsKey("Forwarding")) { $RulesData["Forwarding"] } else { $null }
     $transportArr = if ($TransportData) { @($TransportData) } else { $null }
+
+    $threatForeign  = if ($ThreatData -and $ThreatData.ContainsKey("ForeignSignIns"))         { $ThreatData["ForeignSignIns"] }         else { @() }
+    $threatFailed   = if ($ThreatData -and $ThreatData.ContainsKey("FailedLoginAnalysis"))     { $ThreatData["FailedLoginAnalysis"] }     else { @() }
+    $threatBrute    = if ($ThreatData -and $ThreatData.ContainsKey("BruteForceCandidates"))    { $ThreatData["BruteForceCandidates"] }    else { @() }
+    $threatSpray    = if ($ThreatData -and $ThreatData.ContainsKey("PasswordSprayCandidates")) { $ThreatData["PasswordSprayCandidates"] } else { @() }
+    $threatSAF      = if ($ThreatData -and $ThreatData.ContainsKey("SuccessfulAfterFailures")) { $ThreatData["SuccessfulAfterFailures"] } else { @() }
+    $threatCA       = if ($ThreatData -and $ThreatData.ContainsKey("CANotApplied"))            { $ThreatData["CANotApplied"] }            else { @() }
 
     $csvMap = @(
         @{ Name = "MFA_Registration";  Data = $MfaData }
@@ -1101,10 +1345,16 @@ function Export-DataToCSV {
         @{ Name = "Risk_Detections";    Data = $RiskDetectionsData }
         @{ Name = "Inbox_Rules";        Data = $rulesArr }
         @{ Name = "Forwarding";         Data = $fwdArr }
+        @{ Name = "Foreign_SignIns";                Data = $threatForeign }
+        @{ Name = "Failed_Login_Analysis";          Data = $threatFailed }
+        @{ Name = "Brute_Force_Candidates";         Data = $threatBrute }
+        @{ Name = "Password_Spray_Candidates";      Data = $threatSpray }
+        @{ Name = "Successful_After_Failures";      Data = $threatSAF }
+        @{ Name = "Conditional_Access_NotApplied";  Data = $threatCA }
     )
 
     # CSV sempre generati anche se vuoti (garantisce presenza file per post-processing)
-    $alwaysExport = @("OAuth_Grants")
+    $alwaysExport = @("OAuth_Grants","Foreign_SignIns","Failed_Login_Analysis","Brute_Force_Candidates","Password_Spray_Candidates","Successful_After_Failures","Conditional_Access_NotApplied")
 
     $csvIndex = 0
     foreach ($item in $csvMap) {
@@ -1128,8 +1378,18 @@ function Export-DataToCSV {
         } elseif ($mustExport) {
             # Genera file vuoto con header placeholder per garantire la presenza del file
             try {
+                $placeholderNote = switch ($item.Name) {
+                    "OAuth_Grants"                  { "Nessun dato raccolto - grant OAuth assenti o raccolta saltata per timeout/errore" }
+                    "Foreign_SignIns"               { "Nessun accesso esterno (fuori Italia) rilevato nel periodo analizzato" }
+                    "Failed_Login_Analysis"         { "Nessuna autenticazione fallita rilevata nel periodo analizzato" }
+                    "Brute_Force_Candidates"        { "Nessun candidato brute force rilevato nel periodo analizzato" }
+                    "Password_Spray_Candidates"     { "Nessun candidato password spray rilevato nel periodo analizzato" }
+                    "Successful_After_Failures"     { "Nessun accesso riuscito dopo fallimenti rilevato nel periodo analizzato" }
+                    "Conditional_Access_NotApplied" { "Nessun evento con CA notApplied rilevato nel periodo analizzato" }
+                    default                         { "Nessun dato raccolto - raccolta saltata per timeout/errore" }
+                }
                 [PSCustomObject]@{
-                    Nota = "Nessun dato raccolto - grant OAuth assenti o raccolta saltata per timeout/errore"
+                    Nota = $placeholderNote
                 } | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
                 Write-Log "  CSV: $($item.Name).csv (vuoto - file garantito)" "WARN"
                 $exported.Add($csvPath)
@@ -1261,7 +1521,8 @@ function New-ExcelWorkbook {
         $OAuthData,
         $RiskyUsersData,
         $RiskDetectionsData,
-        $RulesData
+        $RulesData,
+        $ThreatData
     )
 
     Write-Section "GENERAZIONE WORKBOOK EXCEL"
@@ -1959,16 +2220,304 @@ $scoreColorPair = Get-RiskColors -Level $riskLevel
     }
     Set-ExcelColumnWidths -Worksheet $ws12 -Widths @(38, 32, 12, 14, 28, 16, 22, 16, 22)
 
-    #─── 13. RAW DATA (opzionale) ────────────────────────────────────────────
+    #─── 13. AUTHENTICATION THREATS ──────────────────────────────────────────
+    Write-Log "  Creazione: Authentication Threats..." "INFO"
+    $ws13 = New-Sheet "Authentication Threats"
+    Add-ExcelTitleRow -Worksheet $ws13 -Row 1 -Title "ANALISI MINACCE DI AUTENTICAZIONE" -MergeEnd 10
+
+$tForeign = if ($ThreatData -and $ThreatData.ContainsKey("ForeignSignIns")) { @($ThreatData["ForeignSignIns"]) } else { @() }
+$tFailed  = if ($ThreatData -and $ThreatData.ContainsKey("FailedLoginAnalysis")) { @($ThreatData["FailedLoginAnalysis"]) } else { @() }
+$tBrute   = if ($ThreatData -and $ThreatData.ContainsKey("BruteForceCandidates")) { @($ThreatData["BruteForceCandidates"]) } else { @() }
+$tSpray   = if ($ThreatData -and $ThreatData.ContainsKey("PasswordSprayCandidates")) { @($ThreatData["PasswordSprayCandidates"]) } else { @() }
+$tSAF     = if ($ThreatData -and $ThreatData.ContainsKey("SuccessfulAfterFailures")) { @($ThreatData["SuccessfulAfterFailures"]) } else { @() }
+$tCA      = if ($ThreatData -and $ThreatData.ContainsKey("CANotApplied")) { @($ThreatData["CANotApplied"]) } else { @() }
+
+$tForeignCount = @($tForeign).Count
+$tFailedCount  = @($tFailed).Count
+$tBruteCount   = @($tBrute).Count
+$tSprayCount   = @($tSpray).Count
+$tSAFCount     = @($tSAF).Count
+$tCACount      = @($tCA).Count
+$tSAFCriticalCount = @($tSAF | Where-Object { $_.Severity -eq "Critical" }).Count
+
+    $row = 3
+    $ws13.Cells[$row, 1, $row, 10].Merge = $true
+    $ws13.Cells[$row, 1].Value = "RIEPILOGO MINACCE"
+    $ws13.Cells[$row, 1].Style.Font.Bold = $true
+    $ws13.Cells[$row, 1].Style.Font.Size = 12
+    Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.SectionBg -FgColor $Script:Colors.SectionFg
+    $row += 2
+
+    Add-ExcelHeaderRow -Worksheet $ws13 -Row $row -Headers @("Indicatore", "Valore", "Severita", "Descrizione")
+    $row++
+   $kpiRows = @(
+    @{ Label = "Accessi fuori Italia";      Value = $tForeignCount; Sev = if ($tForeignCount -gt 0) { "MEDIO" } else { "OK" }; Desc = "Sign-in con CountryOrRegion diverso da IT" }
+    @{ Label = "Login falliti (gruppi)";    Value = $tFailedCount;  Sev = if ($tFailedCount -gt 20) { "ALTO" } elseif ($tFailedCount -gt 0) { "MEDIO" } else { "OK" }; Desc = "Raggruppati per UPN/IP/Paese/App" }
+    @{ Label = "Candidati Brute Force";     Value = $tBruteCount;   Sev = if ($tBruteCount -gt 0) { "HIGH" } else { "OK" }; Desc = "10+ fallimenti in 15 min per stesso utente" }
+    @{ Label = "Candidati Password Spray";  Value = $tSprayCount;   Sev = if ($tSprayCount -gt 0) { "HIGH" } else { "OK" }; Desc = "Stesso IP vs 5+ utenti distinti" }
+    @{ Label = "Successi dopo fallimenti";  Value = $tSAFCount;     Sev = if ($tSAFCriticalCount -gt 0) { "CRITICO" } elseif ($tSAFCount -gt 0) { "ALTO" } else { "OK" }; Desc = "Login ok dopo 2+ fallimenti in 60 min" }
+    @{ Label = "CA notApplied";             Value = $tCACount;      Sev = if ($tCACount -gt 50) { "ALTO" } elseif ($tCACount -gt 0) { "MEDIO" } else { "OK" }; Desc = "Conditional Access non applicato" }
+)
+
+foreach ($kpi in $kpiRows) {
+    $ws13.Cells[$row, 1].Value = $kpi.Label
+    $ws13.Cells[$row, 2].Value = $kpi.Value
+    $ws13.Cells[$row, 3].Value = $kpi.Sev
+    $ws13.Cells[$row, 4].Value = $kpi.Desc
+    $ws13.Cells[$row, 2].Style.Font.Bold = $true
+    $rcp = Get-RiskColors -Level $kpi.Sev
+    Set-ExcelRowColor -Worksheet $ws13 -Row $row -ColCount 4 -BgColor $rcp[0] -FgColor $rcp[1]
+    $row++
+}
+
+    $row += 2
+
+    # Section 1: Foreign Sign-Ins
+$ws13.Cells[$row, 1, $row, 10].Merge = $true
+$ws13.Cells[$row, 1].Value = "1. ACCESSI FUORI ITALIA ($tForeignCount eventi)"
+$ws13.Cells[$row, 1].Style.Font.Bold = $true
+Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.SectionBg -FgColor $Script:Colors.SectionFg
+$row++
+
+if ($tForeignCount -gt 0) {
+    Add-ExcelHeaderRow -Worksheet $ws13 -Row $row -Headers @("UPN","Data/Ora","IP","Paese","Citta","App","Client","Risultato","Cod.Stato","CA Status")
+    $row++
+
+    foreach ($item in ($tForeign | Select-Object -First 300)) {
+        $ws13.Cells[$row,1].Value=$item.UPN; $ws13.Cells[$row,2].Value=$item.CreatedDateTime
+        $ws13.Cells[$row,3].Value=$item.IPAddress; $ws13.Cells[$row,4].Value=$item.Country
+        $ws13.Cells[$row,5].Value=$item.City; $ws13.Cells[$row,6].Value=$item.AppDisplayName
+        $ws13.Cells[$row,7].Value=$item.ClientAppUsed; $ws13.Cells[$row,8].Value=$item.Result
+        $ws13.Cells[$row,9].Value=$item.StatusCode; $ws13.Cells[$row,10].Value=$item.ConditionalAccessStatus
+
+        if ($item.Result -eq "Success") {
+            Set-ExcelRowColor -Worksheet $ws13 -Row $row -ColCount 10 -BgColor $Script:Colors.HighBg -FgColor "FFFFFF"
+        }
+        elseif ($item.Result -eq "Failure") {
+            Set-ExcelRowColor -Worksheet $ws13 -Row $row -ColCount 10 -BgColor $Script:Colors.MediumBg -FgColor "000000"
+        }
+
+        $row++
+    }
+}
+else {
+    $ws13.Cells[$row,1,$row,10].Merge=$true
+    $ws13.Cells[$row,1].Value="Nessun accesso estero rilevato."
+    Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.OkBg -FgColor "FFFFFF"
+    $row++
+}
+
+$row++
+
+# Section 2: Failed Login Analysis
+$ws13.Cells[$row,1,$row,10].Merge=$true
+$ws13.Cells[$row,1].Value="2. ANALISI FALLIMENTI AUTENTICAZIONE ($tFailedCount gruppi)"
+$ws13.Cells[$row,1].Style.Font.Bold=$true
+Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.SectionBg -FgColor $Script:Colors.SectionFg
+$row++
+
+if ($tFailedCount -gt 0) {
+    Add-ExcelHeaderRow -Worksheet $ws13 -Row $row -Headers @("UPN","IP","Paese","App","Nr Fallimenti","Prima Occ.","Ultima Occ.","Campione Errori")
+    $row++
+
+    foreach ($item in ($tFailed | Select-Object -First 200)) {
+        $ws13.Cells[$row,1].Value=$item.UPN
+        $ws13.Cells[$row,2].Value=$item.IPAddress
+        $ws13.Cells[$row,3].Value=$item.Country
+        $ws13.Cells[$row,4].Value=$item.AppDisplayName
+        $ws13.Cells[$row,5].Value=$item.FailureCount
+        $ws13.Cells[$row,5].Style.Font.Bold=$true
+        $ws13.Cells[$row,6].Value=$item.FirstSeen
+        $ws13.Cells[$row,7].Value=$item.LastSeen
+        $ws13.Cells[$row,8].Value=$item.SampleErrors
+
+        if ($item.FailureCount -ge 50) {
+            Set-ExcelRowColor -Worksheet $ws13 -Row $row -ColCount 8 -BgColor $Script:Colors.CriticalBg -FgColor "FFFFFF"
+        }
+        elseif ($item.FailureCount -ge 10) {
+            Set-ExcelRowColor -Worksheet $ws13 -Row $row -ColCount 8 -BgColor $Script:Colors.HighBg -FgColor "FFFFFF"
+        }
+        elseif ($item.FailureCount -ge 5) {
+            Set-ExcelRowColor -Worksheet $ws13 -Row $row -ColCount 8 -BgColor $Script:Colors.MediumBg -FgColor "000000"
+        }
+
+        $row++
+    }
+}
+else {
+    $ws13.Cells[$row,1,$row,8].Merge=$true
+    $ws13.Cells[$row,1].Value="Nessun fallimento rilevato."
+    Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.OkBg -FgColor "FFFFFF"
+    $row++
+}
+
+$row++
+
+
+# Section 3: Brute Force
+$ws13.Cells[$row,1,$row,9].Merge=$true
+$ws13.Cells[$row,1].Value="3. CANDIDATI BRUTE FORCE - HIGH ($tBruteCount utenti)"
+$ws13.Cells[$row,1].Style.Font.Bold=$true
+Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.HighBg -FgColor "FFFFFF"
+$row++
+
+if ($tBruteCount -gt 0) {
+    Add-ExcelHeaderRow -Worksheet $ws13 -Row $row -Headers @("UPN","Fail/Finestra","Inizio","Fine","Min","IP","Paesi","App","Severita")
+    $row++
+
+    foreach ($item in $tBrute) {
+        $ws13.Cells[$row,1].Value=$item.UPN
+        $ws13.Cells[$row,2].Value=$item.FailuresInWindow
+        $ws13.Cells[$row,3].Value=$item.WindowStart
+        $ws13.Cells[$row,4].Value=$item.WindowEnd
+        $ws13.Cells[$row,5].Value=$item.WindowMinutes
+        $ws13.Cells[$row,6].Value=$item.IPAddresses
+        $ws13.Cells[$row,7].Value=$item.Countries
+        $ws13.Cells[$row,8].Value=$item.Apps
+        $ws13.Cells[$row,9].Value=$item.Severity
+
+        Set-ExcelRowColor -Worksheet $ws13 -Row $row -ColCount 9 -BgColor $Script:Colors.HighBg -FgColor "FFFFFF"
+        $row++
+    }
+}
+else {
+    $ws13.Cells[$row,1,$row,9].Merge=$true
+    $ws13.Cells[$row,1].Value="Nessun candidato brute force (soglia: 10 fail in 15 min)."
+    Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.OkBg -FgColor "FFFFFF"
+    $row++
+}
+
+$row++
+
+
+# Section 4: Password Spray
+$ws13.Cells[$row,1,$row,9].Merge=$true
+$ws13.Cells[$row,1].Value="4. CANDIDATI PASSWORD SPRAY - HIGH ($tSprayCount IP sospetti)"
+$ws13.Cells[$row,1].Style.Font.Bold=$true
+Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.HighBg -FgColor "FFFFFF"
+$row++
+
+if ($tSprayCount -gt 0) {
+    Add-ExcelHeaderRow -Worksheet $ws13 -Row $row -Headers @("IP","Utenti Distinti","Tentativi","Utenti Bersaglio","Paesi","App","Prima Vista","Ultima Vista","Severita")
+    $row++
+
+    foreach ($item in $tSpray) {
+        $ws13.Cells[$row,1].Value=$item.IPAddress
+        $ws13.Cells[$row,2].Value=$item.DistinctUsers
+        $ws13.Cells[$row,3].Value=$item.TotalAttempts
+        $ws13.Cells[$row,4].Value=$item.TargetUsers
+        $ws13.Cells[$row,5].Value=$item.Countries
+        $ws13.Cells[$row,6].Value=$item.Apps
+        $ws13.Cells[$row,7].Value=$item.FirstSeen
+        $ws13.Cells[$row,8].Value=$item.LastSeen
+        $ws13.Cells[$row,9].Value=$item.Severity
+
+        Set-ExcelRowColor -Worksheet $ws13 -Row $row -ColCount 9 -BgColor $Script:Colors.HighBg -FgColor "FFFFFF"
+        $row++
+    }
+}
+else {
+    $ws13.Cells[$row,1,$row,9].Merge=$true
+    $ws13.Cells[$row,1].Value="Nessun candidato password spray (soglia: 1 IP vs 5+ utenti)."
+    Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.OkBg -FgColor "FFFFFF"
+    $row++
+}
+
+$row++
+
+
+# Section 5: Successful After Failures
+$ws13.Cells[$row,1,$row,10].Merge=$true
+$ws13.Cells[$row,1].Value="5. SUCCESSI DOPO FALLIMENTI ($tSAFCount) - Critical se paese estero"
+$ws13.Cells[$row,1].Style.Font.Bold=$true
+Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.CriticalBg -FgColor "FFFFFF"
+$row++
+
+if ($tSAFCount -gt 0) {
+    Add-ExcelHeaderRow -Worksheet $ws13 -Row $row -Headers @("UPN","Login Riuscito","IP","Paese","Citta","App","Fail Prima","Finestra(min)","Primo Fail","Severita")
+    $row++
+
+    foreach ($item in $tSAF) {
+        $ws13.Cells[$row,1].Value=$item.UPN
+        $ws13.Cells[$row,2].Value=$item.SuccessDateTime
+        $ws13.Cells[$row,3].Value=$item.SuccessIP
+        $ws13.Cells[$row,4].Value=$item.SuccessCountry
+        $ws13.Cells[$row,5].Value=$item.SuccessCity
+        $ws13.Cells[$row,6].Value=$item.SuccessApp
+        $ws13.Cells[$row,7].Value=$item.FailuresBefore
+        $ws13.Cells[$row,8].Value=$item.FailureWindowMin
+        $ws13.Cells[$row,9].Value=$item.FirstFailure
+        $ws13.Cells[$row,10].Value=$item.Severity
+
+        if ($item.Severity -eq "Critical") {
+            Set-ExcelRowColor -Worksheet $ws13 -Row $row -ColCount 10 -BgColor $Script:Colors.CriticalBg -FgColor "FFFFFF"
+        }
+        else {
+            Set-ExcelRowColor -Worksheet $ws13 -Row $row -ColCount 10 -BgColor $Script:Colors.HighBg -FgColor "FFFFFF"
+        }
+
+        $row++
+    }
+}
+else {
+    $ws13.Cells[$row,1,$row,10].Merge=$true
+    $ws13.Cells[$row,1].Value="Nessun successo dopo fallimenti (soglia: 2+ fail in 60 min)."
+    Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.OkBg -FgColor "FFFFFF"
+    $row++
+}
+
+$row++
+
+
+# Section 6: CA NotApplied
+$ws13.Cells[$row,1,$row,10].Merge=$true
+$ws13.Cells[$row,1].Value="6. CONDITIONAL ACCESS NON APPLICATO ($tCACount eventi)"
+$ws13.Cells[$row,1].Style.Font.Bold=$true
+Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.MediumBg -FgColor "000000"
+$row++
+
+if ($tCACount -gt 0) {
+    Add-ExcelHeaderRow -Worksheet $ws13 -Row $row -Headers @("UPN","Data/Ora","IP","Paese","Citta","App","Client","Risultato","Cod.Stato","CA Status")
+    $row++
+
+    foreach ($item in ($tCA | Select-Object -First 300)) {
+        $ws13.Cells[$row,1].Value=$item.UPN
+        $ws13.Cells[$row,2].Value=$item.CreatedDateTime
+        $ws13.Cells[$row,3].Value=$item.IPAddress
+        $ws13.Cells[$row,4].Value=$item.Country
+        $ws13.Cells[$row,5].Value=$item.City
+        $ws13.Cells[$row,6].Value=$item.AppDisplayName
+        $ws13.Cells[$row,7].Value=$item.ClientAppUsed
+        $ws13.Cells[$row,8].Value=$item.Result
+        $ws13.Cells[$row,9].Value=$item.StatusCode
+        $ws13.Cells[$row,10].Value=$item.ConditionalAccessStatus
+
+        if ($item.Result -eq "Success") {
+            Set-ExcelRowColor -Worksheet $ws13 -Row $row -ColCount 10 -BgColor $Script:Colors.MediumBg -FgColor "000000"
+        }
+
+        $row++
+    }
+}
+else {
+    $ws13.Cells[$row,1,$row,10].Merge=$true
+    $ws13.Cells[$row,1].Value="Nessun evento con CA non applicato rilevato."
+    Set-ExcelCellColor -Worksheet $ws13 -Row $row -Col 1 -BgColor $Script:Colors.OkBg -FgColor "FFFFFF"
+    $row++
+}
+
+Set-ExcelColumnWidths -Worksheet $ws13 -Widths @(38,14,16,10,12,28,22,12,12,18)
+
+    #─── 14. RAW DATA (opzionale) ────────────────────────────────────────────
     if ($IncludeRawData) {
         Write-Log "  Creazione: Raw Data (richiesto)..." "INFO"
-        $ws13 = New-Sheet "Raw Data"
+        $ws14 = New-Sheet "Raw Data"
 
-        Add-ExcelTitleRow -Worksheet $ws13 -Row 1 -Title "DATI GREZZI - PER ANALISI TECNICA AVANZATA" -MergeEnd 4
+        Add-ExcelTitleRow -Worksheet $ws14 -Row 1 -Title "DATI GREZZI - PER ANALISI TECNICA AVANZATA" -MergeEnd 4
 
         $row = 3
-        $ws13.Cells[$row, 1].Value = "Statistiche Raccolta Dati"
-        $ws13.Cells[$row, 1].Style.Font.Bold = $true
+        $ws14.Cells[$row, 1].Value = "Statistiche Raccolta Dati"
+        $ws14.Cells[$row, 1].Style.Font.Bold = $true
         $row++
 
         $rulesCountRaw = 0
@@ -2007,11 +2556,11 @@ $scoreColorPair = Get-RiskColors -Level $riskLevel
         )
 
         foreach ($stat in $rawStats) {
-            $ws13.Cells[$row, 1].Value = $stat[0]
-            $ws13.Cells[$row, 2].Value = $stat[1]
+            $ws14.Cells[$row, 1].Value = $stat[0]
+            $ws14.Cells[$row, 2].Value = $stat[1]
             $row++
         }
-        Set-ExcelColumnWidths -Worksheet $ws13 -Widths @(40, 15, 40, 15)
+        Set-ExcelColumnWidths -Worksheet $ws14 -Widths @(40, 15, 40, 15)
     }
 
     # Imposta il primo foglio come attivo
@@ -2179,10 +2728,19 @@ function New-HtmlReport {
         $LegacyData,
         $OAuthData,
         $RulesData,
-        $CasData
+        $CasData,
+        $ThreatData
     )
 
     Write-Progress -Activity "Generazione HTML Report" -Status "Calcolo metriche..." -PercentComplete 10
+
+    # Metriche Threat Analysis
+    $threatForeignCount = if ($ThreatData -and $ThreatData.ContainsKey("ForeignSignIns"))         { @($ThreatData["ForeignSignIns"]).Count }         else { 0 }
+    $threatFailedCount  = if ($ThreatData -and $ThreatData.ContainsKey("FailedLoginAnalysis"))     { @($ThreatData["FailedLoginAnalysis"]).Count }     else { 0 }
+    $threatBruteCount   = if ($ThreatData -and $ThreatData.ContainsKey("BruteForceCandidates"))    { @($ThreatData["BruteForceCandidates"]).Count }    else { 0 }
+    $threatSprayIPCount = if ($ThreatData -and $ThreatData.ContainsKey("PasswordSprayCandidates")) { @($ThreatData["PasswordSprayCandidates"]).Count } else { 0 }
+    $threatSAFCount     = if ($ThreatData -and $ThreatData.ContainsKey("SuccessfulAfterFailures")) { @($ThreatData["SuccessfulAfterFailures"]).Count } else { 0 }
+    $threatCACount      = if ($ThreatData -and $ThreatData.ContainsKey("CANotApplied"))            { @($ThreatData["CANotApplied"]).Count }            else { 0 }
 
     # ── Calcolo metriche ───────────────────────────────────────────────────────
     if ($LegacyData) {
@@ -2370,6 +2928,13 @@ function New-HtmlReport {
 
     Write-Progress -Activity "Generazione HTML Report" -Status "Scrittura file HTML..." -PercentComplete 70
 
+    $tForeignColor  = if ($threatForeignCount -gt 0)  { "#cc4400" } else { "#1a7a1a" }
+    $tFailedColor   = if ($threatFailedCount -gt 20)  { "#cc4400" } elseif ($threatFailedCount -gt 0) { "#b38a00" } else { "#1a7a1a" }
+    $tSprayColor    = if ($threatSprayIPCount -gt 0)  { "#cc4400" } else { "#1a7a1a" }
+    $tBruteColor    = if ($threatBruteCount -gt 0)    { "#a00000" } else { "#1a7a1a" }
+    $tSAFColor      = if ($threatSAFCount -gt 0)      { "#a00000" } else { "#1a7a1a" }
+    $tCAColor       = if ($threatCACount -gt 50)      { "#cc4400" } elseif ($threatCACount -gt 0) { "#b38a00" } else { "#1a7a1a" }
+
     # ── Template HTML ─────────────────────────────────────────────────────────
     $html = @"
 <!DOCTYPE html>
@@ -2454,6 +3019,22 @@ function New-HtmlReport {
     </div>
   </div>
 
+  <!-- MINACCE DI AUTENTICAZIONE -->
+  <div class="card">
+    <div class="card-header">&#x1F6A8; Minacce di Autenticazione</div>
+    <div class="card-body">
+      <div class="kpi-grid">
+        <div class="kpi" style="border-left-color:$tForeignColor"><div class="val" style="color:$tForeignColor">$threatForeignCount</div><div class="lbl">Login fuori Italia</div></div>
+        <div class="kpi" style="border-left-color:$tFailedColor"><div class="val" style="color:$tFailedColor">$threatFailedCount</div><div class="lbl">Gruppi Login Falliti</div></div>
+        <div class="kpi" style="border-left-color:$tSprayColor"><div class="val" style="color:$tSprayColor">$threatSprayIPCount</div><div class="lbl">IP Sospetti (Spray)</div></div>
+        <div class="kpi" style="border-left-color:$tBruteColor"><div class="val" style="color:$tBruteColor">$threatBruteCount</div><div class="lbl">Utenti Brute Force</div></div>
+        <div class="kpi" style="border-left-color:$tSAFColor"><div class="val" style="color:$tSAFColor">$threatSAFCount</div><div class="lbl">Successi dopo Fallimenti</div></div>
+        <div class="kpi" style="border-left-color:$tCAColor"><div class="val" style="color:$tCAColor">$threatCACount</div><div class="lbl">CA notApplied</div></div>
+      </div>
+      <p style="margin-top:14px;font-size:0.82em;color:#555">Analisi sui sign-in log degli ultimi <strong>$LookbackDays giorni</strong>. Brute Force: 10+ fail in 15 min | Password Spray: stesso IP vs 5+ utenti | SAF: 2+ fail + successo in 60 min. Dettagli nel foglio <em>Authentication Threats</em> del workbook Excel.</p>
+    </div>
+  </div>
+
   <!-- RISCHI -->
   <div class="card">
     <div class="card-header">&#x26A0; Rischi Principali</div>
@@ -2534,6 +3115,7 @@ function Main {
         $caData             = if (-not $SkipGraph)    { Get-ConditionalAccessData }            else { $null }
         $signInData         = if (-not $SkipGraph)    { Get-SignInLogsData -Days $LookbackDays }else { $null }
         $legacyData         = if ($signInData)         { Get-LegacyAuthData -SignInLogs $signInData } else { $null }
+        $threatData         = if ($signInData)         { Get-AuthenticationThreatAnalysis -SignInLogs $signInData } else { $null }
         $rolesData          = if (-not $SkipGraph)    { Get-DirectoryRolesData }               else { $null }
         $oauthData          = if (-not $SkipGraph)    { Get-OAuthGrantsData }                  else { $null }
         $riskyUsersData     = if (-not $SkipGraph)    { Get-RiskyUsersData }                   else { $null }
@@ -2580,7 +3162,8 @@ function Main {
             -OAuthData          $oauthData `
             -RiskyUsersData     $riskyUsersData `
             -RiskDetectionsData $riskDetectionsData `
-            -RulesData          $rulesData
+            -RulesData          $rulesData `
+            -ThreatData         $threatData
 
         Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
             -Status "Fase 6/7: Generazione Excel Workbook..." -PercentComplete 76
@@ -2599,7 +3182,8 @@ function Main {
             -OAuthData          $oauthData `
             -RiskyUsersData     $riskyUsersData `
             -RiskDetectionsData $riskDetectionsData `
-            -RulesData          $rulesData
+            -RulesData          $rulesData `
+            -ThreatData         $threatData
 
         Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
             -Status "Fase 6/7: Generazione Report Markdown..." -PercentComplete 84
@@ -2626,7 +3210,8 @@ function Main {
             -LegacyData   $legacyData `
             -OAuthData    $oauthData `
             -RulesData    $rulesData `
-            -CasData      $casData
+            -CasData      $casData `
+            -ThreatData   $threatData
 
         # ─ Fase 7: Riepilogo ───────────────────────────────────────────────────
         Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
