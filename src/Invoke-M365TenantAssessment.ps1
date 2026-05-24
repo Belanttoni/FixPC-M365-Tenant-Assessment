@@ -35,6 +35,10 @@
 .EXAMPLE
     .\Invoke-M365TenantAssessment.ps1 -TenantName "contoso" -IncidentUser "john.doe@contoso.com" -IncludeRawData
 
+.PARAMETER CollectionTimeoutMinutes
+    Timeout in minuti per ogni singola coleta di dati. Default: 5.
+    Se una coleta supera il limite, viene registrato un WARN e l'assessment continua.
+
 .PARAMETER SyntaxOnly
     Switch per eseguire solo la verifica sintattica del file e uscire immediatamente.
     Non richiede connessioni o moduli extra oltre al parser PowerShell nativo.
@@ -48,7 +52,7 @@
 
 .NOTES
     Autore: Security Assessment Script
-    Versione: 2.3
+    Versione: 2.4
     Requisiti: PowerShell 7+, Microsoft.Graph >= 2.0, ExchangeOnlineManagement >= 3.0,
                ImportExcel >= 7.0 (obbligatorio: carica EPPlus/OfficeOpenXml usato internamente)
     IMPORTANTE: Script read-only - non apporta modifiche al tenant.
@@ -82,13 +86,17 @@ param(
     [Parameter(Mandatory = $false, HelpMessage = "Salta raccolta Microsoft Graph (test parziale)")]
     [switch]$SkipGraph,
 
+    [Parameter(Mandatory = $false, HelpMessage = "Timeout in minuti per ogni singola raccolta dati (default 5)")]
+    [ValidateRange(1, 60)]
+    [int]$CollectionTimeoutMinutes = 5,
+
     [Parameter(Mandatory = $false, HelpMessage = "Esegue solo verifica sintattica del file e termina (non richiede connessioni)")]
     [switch]$SyntaxOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"
-$ProgressPreference    = "SilentlyContinue"
+$ProgressPreference    = "Continue"
 
 # Imposta OutputPath di default se non specificato (non usabile nel param default con Get-Date)
 if ([string]::IsNullOrEmpty($OutputPath)) {
@@ -97,10 +105,11 @@ if ([string]::IsNullOrEmpty($OutputPath)) {
 
 #region ─── COSTANTI E CONFIGURAZIONE ──────────────────────────────────────────
 
-$Script:AssessmentVersion = "2.3"
-$Script:StartTime         = Get-Date
-$Script:LogFile           = $null
-$Script:OutputDir         = $null
+$Script:AssessmentVersion        = "2.4"
+$Script:StartTime                = Get-Date
+$Script:LogFile                  = $null
+$Script:OutputDir                = $null
+$Script:CollectionTimeoutMinutes = $CollectionTimeoutMinutes
 
 # Soglie per il calcolo del security score
 $Script:ScoreThresholds = @{
@@ -268,8 +277,14 @@ function Test-AndImportModules {
         @{ Name = "ImportExcel";              MinVersion = "7.0.0" }
     )
 
-    $allOk = $true
+    $allOk    = $true
+    $modIndex = 0
     foreach ($mod in $requiredModules) {
+        $modIndex++
+        Write-Progress -Activity "Verifica moduli PowerShell" `
+            -Status "Controllo: $($mod.Name)" `
+            -PercentComplete ([math]::Round(($modIndex / $requiredModules.Count) * 100))
+
         # Salta moduli non necessari in base ai parametri
         if ($SkipGraph   -and $mod.Name -eq "Microsoft.Graph")          { continue }
         if ($SkipExchange -and $mod.Name -eq "ExchangeOnlineManagement") { continue }
@@ -295,6 +310,7 @@ function Test-AndImportModules {
             }
         }
     }
+    Write-Progress -Activity "Verifica moduli PowerShell" -Completed
 
     if (-not $allOk) {
         throw "Uno o piu moduli richiesti non sono disponibili. Installare i moduli mancanti e riprovare."
@@ -310,6 +326,7 @@ function Connect-ToMicrosoftGraph {
     Write-Section "CONNESSIONE MICROSOFT GRAPH"
     Write-Log "Scope richiesti: $($Script:GraphScopes -join ', ')" "INFO"
 
+    Write-Progress -Activity "Connessione Microsoft Graph" -Status "Verifica contesto esistente..." -PercentComplete 10
     try {
         $ctx = Get-MgContext -ErrorAction SilentlyContinue
         if ($ctx -and $ctx.TenantId) {
@@ -320,15 +337,19 @@ function Connect-ToMicrosoftGraph {
                 Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
             } else {
                 Write-Log "Scope verificati. Connessione valida." "SUCCESS"
+                Write-Progress -Activity "Connessione Microsoft Graph" -Completed
                 return
             }
         }
 
+        Write-Progress -Activity "Connessione Microsoft Graph" -Status "Autenticazione in corso..." -PercentComplete 50
         Connect-MgGraph -Scopes $Script:GraphScopes -TenantId $TenantName -NoWelcome -ErrorAction Stop
         $ctx = Get-MgContext
         Write-Log "Connesso al Graph come: $($ctx.Account)" "SUCCESS"
         Write-Log "Tenant ID: $($ctx.TenantId)" "INFO"
+        Write-Progress -Activity "Connessione Microsoft Graph" -Completed
     } catch {
+        Write-Progress -Activity "Connessione Microsoft Graph" -Completed
         throw "Connessione Microsoft Graph fallita: $($_.Exception.Message)"
     }
 }
@@ -336,12 +357,14 @@ function Connect-ToMicrosoftGraph {
 function Connect-ToExchangeOnline {
     Write-Section "CONNESSIONE EXCHANGE ONLINE"
 
+    Write-Progress -Activity "Connessione Exchange Online" -Status "Verifica sessione esistente..." -PercentComplete 20
     try {
         $existingSession = Get-PSSession | Where-Object {
             $_.ConfigurationName -eq "Microsoft.Exchange" -and $_.State -eq "Opened"
         }
         if ($existingSession) {
             Write-Log "Gia connesso a Exchange Online." "INFO"
+            Write-Progress -Activity "Connessione Exchange Online" -Completed
             return
         }
 
@@ -351,9 +374,12 @@ function Connect-ToExchangeOnline {
             "$TenantName.onmicrosoft.com"
         }
 
+        Write-Progress -Activity "Connessione Exchange Online" -Status "Autenticazione per $tenantDomain..." -PercentComplete 60
         Connect-ExchangeOnline -Organization $tenantDomain -ShowBanner:$false -ErrorAction Stop
         Write-Log "Connesso a Exchange Online per: $tenantDomain" "SUCCESS"
+        Write-Progress -Activity "Connessione Exchange Online" -Completed
     } catch {
+        Write-Progress -Activity "Connessione Exchange Online" -Completed
         throw "Connessione Exchange Online fallita: $($_.Exception.Message)"
     }
 }
@@ -363,20 +389,77 @@ function Connect-ToExchangeOnline {
 #region ─── RACCOLTA DATI ──────────────────────────────────────────────────────
 
 function Invoke-SafeCollection {
+    <#
+    .SYNOPSIS
+        Esegue una raccolta dati con timeout isolato per coleta.
+    .DESCRIPTION
+        Tenta l'esecuzione in un ThreadJob (PS7) per isolation e timeout reale.
+        Se il ThreadJob non riesce (contesto sessione non condiviso), esegue inline.
+        In entrambi i casi: registra WARN se timeout, non interrompe l'assessment.
+    #>
     param(
         [string]$CollectionName,
-        [scriptblock]$ScriptBlock
+        [scriptblock]$ScriptBlock,
+        [int]$TimeoutSec = ($Script:CollectionTimeoutMinutes * 60)
     )
 
-    Write-Log "Raccolta: $CollectionName..." "INFO"
+    Write-Log "Raccolta: $CollectionName (timeout: $([math]::Round($TimeoutSec/60,1)) min)..." "INFO"
+    $sw  = [System.Diagnostics.Stopwatch]::StartNew()
+    $job = $null
+
     try {
-        $result = & $ScriptBlock
-        $count  = if ($result -is [Array]) { $result.Count } elseif ($null -eq $result) { 0 } else { 1 }
-        Write-Log "Completato: $CollectionName - $count elementi raccolti." "SUCCESS"
+        # Tentativo con ThreadJob per timeout reale
+        $job      = Start-ThreadJob -ScriptBlock $ScriptBlock -ErrorAction Stop
+        $completed = $job | Wait-Job -Timeout $TimeoutSec
+
+        if ($null -eq $completed) {
+            # TIMEOUT: interrompi il job e segnala WARN
+            $job | Stop-Job -ErrorAction SilentlyContinue
+            $job | Remove-Job -Force -ErrorAction SilentlyContinue
+            $sw.Stop()
+            Write-Log "[TIMEOUT] '$CollectionName' ha superato $([math]::Round($TimeoutSec/60,1)) min - dati non raccolti, assessment continua." "WARN"
+            return $null
+        }
+
+        if ($job.State -eq 'Failed') {
+            $jobErr = ($job.ChildJobs | ForEach-Object { $_.Error } | Select-Object -First 1)
+            $job | Remove-Job -Force -ErrorAction SilentlyContinue
+            $errMsg = if ($jobErr) { $jobErr.Exception.Message } else { "Errore sconosciuto nel thread job" }
+            throw $errMsg
+        }
+
+        $result = $job | Receive-Job -ErrorAction SilentlyContinue
+        $job | Remove-Job -Force -ErrorAction SilentlyContinue
+        $sw.Stop()
+
+        $count = if ($result -is [Array]) { $result.Count } elseif ($null -eq $result) { 0 } else { 1 }
+        Write-Log "Completato: $CollectionName - $count elementi ($([math]::Round($sw.Elapsed.TotalSeconds))s)." "SUCCESS"
         return $result
+
     } catch {
-        Write-Log "ERRORE in '$CollectionName': $($_.Exception.Message)" "ERROR"
-        return $null
+        # Fallback inline: il ThreadJob potrebbe non condividere il contesto EXO/Graph
+        if ($job) { $job | Remove-Job -Force -ErrorAction SilentlyContinue }
+        $jobErrMsg = $_.Exception.Message
+
+        Write-Log "ThreadJob non disponibile per '$CollectionName' ($jobErrMsg) - esecuzione inline..." "WARN"
+        $sw.Restart()
+
+        try {
+            $result = & $ScriptBlock
+            $sw.Stop()
+
+            if ($sw.Elapsed.TotalSeconds -gt $TimeoutSec) {
+                Write-Log "[LENTO] '$CollectionName' ha impiegato $([math]::Round($sw.Elapsed.TotalSeconds))s (soglia: $([math]::Round($TimeoutSec/60,1)) min)." "WARN"
+            }
+            $count = if ($result -is [Array]) { $result.Count } elseif ($null -eq $result) { 0 } else { 1 }
+            Write-Log "Completato (inline): $CollectionName - $count elementi ($([math]::Round($sw.Elapsed.TotalSeconds))s)." "SUCCESS"
+            return $result
+
+        } catch {
+            $sw.Stop()
+            Write-Log "ERRORE in '$CollectionName': $($_.Exception.Message)" "ERROR"
+            return $null
+        }
     }
 }
 
@@ -562,48 +645,110 @@ function Get-DirectoryRolesData {
 }
 
 function Get-OAuthGrantsData {
+    # Cattura variabili di scope esterno per compatibilita con ThreadJob
+    $highRiskOAuthScopes = $Script:HighRiskOAuthScopes
+
     return Invoke-SafeCollection -CollectionName "OAuth Grants & Service Principals" -ScriptBlock {
+        # Nota: quando eseguito inline, $using: non e necessario; il blocco usa
+        # il valore catturato in $highRiskOAuthScopes dalla chiusura padre.
+        $localHighRiskScopes = if ($null -ne $using:highRiskOAuthScopes) {
+            $using:highRiskOAuthScopes
+        } else {
+            @("Mail.ReadWrite","Mail.Send","Files.ReadWrite.All","Directory.ReadWrite.All")
+        }
+
         $grants  = Get-MgOauth2PermissionGrant -All -ErrorAction Stop
         $spCache = @{}
 
         $grantData = [System.Collections.Generic.List[PSCustomObject]]::new()
         foreach ($grant in $grants) {
-            if (-not $spCache.ContainsKey($grant.ClientId)) {
+            # Gestione difensiva: salta grant con struttura anomala
+            try {
+                if ($null -eq $grant -or [string]::IsNullOrEmpty($grant.ClientId)) {
+                    continue
+                }
+
+                # Lookup Service Principal con cache
+                if (-not $spCache.ContainsKey($grant.ClientId)) {
+                    try {
+                        $sp = Get-MgServicePrincipal -ServicePrincipalId $grant.ClientId -ErrorAction SilentlyContinue
+                        $spCache[$grant.ClientId] = $sp
+                    } catch {
+                        $spCache[$grant.ClientId] = $null
+                    }
+                }
+                $sp = $spCache[$grant.ClientId]
+
+                # DisplayName con fallback
+                $spName = "N/A"
                 try {
-                    $sp = Get-MgServicePrincipal -ServicePrincipalId $grant.ClientId -ErrorAction SilentlyContinue
-                    $spCache[$grant.ClientId] = $sp
-                } catch {
-                    $spCache[$grant.ClientId] = $null
-                }
+                    if ($sp -and $sp.PSObject.Properties.Name -contains 'DisplayName' -and $sp.DisplayName) {
+                        $spName = $sp.DisplayName
+                    }
+                } catch { }
+
+                # PublisherName con ricerca difensiva in piu proprieta
+                $spPublisher = "N/A"
+                try {
+                    if ($sp) {
+                        if ($sp.PSObject.Properties.Name -contains 'PublisherName' -and
+                            $null -ne $sp.PublisherName -and $sp.PublisherName -ne '') {
+                            $spPublisher = $sp.PublisherName
+                        } elseif ($sp.AdditionalProperties -and
+                                  $sp.AdditionalProperties -is [System.Collections.IDictionary] -and
+                                  $sp.AdditionalProperties.ContainsKey('publisherName') -and
+                                  $sp.AdditionalProperties['publisherName']) {
+                            $spPublisher = $sp.AdditionalProperties['publisherName']
+                        }
+                    }
+                } catch { }
+
+                # Scopes e rischio
+                $scopeString = ""
+                try {
+                    if ($grant.PSObject.Properties.Name -contains 'Scope' -and $grant.Scope) {
+                        $scopeString = $grant.Scope
+                    }
+                } catch { }
+
+                $scopes         = if ($scopeString) { $scopeString -split " " } else { @() }
+                $highRiskScopes = @($scopes | Where-Object { $_ -in $localHighRiskScopes })
+                $riskLevel      = if ($highRiskScopes.Count -gt 0) { "ALTO" } else { "BASSO" }
+
+                # ExpiryTime con accesso difensivo
+                $expiryTime = $null
+                try {
+                    if ($grant.PSObject.Properties.Name -contains 'ExpiryTime') {
+                        $expiryTime = $grant.ExpiryTime
+                    } elseif ($grant.AdditionalProperties -and
+                              $grant.AdditionalProperties -is [System.Collections.IDictionary] -and
+                              $grant.AdditionalProperties.ContainsKey('expiryTime')) {
+                        $expiryTime = $grant.AdditionalProperties['expiryTime']
+                    }
+                } catch { }
+
+                # ConsentType e PrincipalId con fallback
+                $consentType = try { $grant.ConsentType } catch { "N/A" }
+                $principalId = try { $grant.PrincipalId } catch { $null }
+                $resourceId  = try { $grant.ResourceId  } catch { $null }
+
+                $grantData.Add([PSCustomObject]@{
+                    ClientId          = $grant.ClientId
+                    ClientDisplayName = $spName
+                    ClientPublisher   = $spPublisher
+                    ConsentType       = $consentType
+                    PrincipalId       = $principalId
+                    ResourceId        = $resourceId
+                    Scopes            = $scopeString
+                    HighRiskScopes    = ($highRiskScopes -join "; ")
+                    RiskLevel         = $riskLevel
+                    ExpiryTime        = $expiryTime
+                })
+            } catch {
+                # Grant con struttura anomala: skippa e continua
+                $grantId = try { $grant.ClientId } catch { "sconosciuto" }
+                Write-Warning "OAuth Grant '$grantId' saltato per struttura anomala: $($_.Exception.Message)"
             }
-            $sp = $spCache[$grant.ClientId]
-
-            $spName      = if ($sp -and $sp.DisplayName)  { $sp.DisplayName }  else { "N/A" }
-            $spPublisher = "N/A"
-            if ($sp) {
-                if ($sp.PSObject.Properties.Name -contains "PublisherName" -and $sp.PublisherName) {
-                    $spPublisher = $sp.PublisherName
-                } elseif ($sp.AdditionalProperties -and $sp.AdditionalProperties.ContainsKey("publisherName")) {
-                    $spPublisher = $sp.AdditionalProperties["publisherName"]
-                }
-            }
-
-            $scopes         = $grant.Scope -split " "
-            $highRiskScopes = @($scopes | Where-Object { $_ -in $Script:HighRiskOAuthScopes })
-            $riskLevel      = if ($highRiskScopes.Count -gt 0) { "ALTO" } else { "BASSO" }
-
-            $grantData.Add([PSCustomObject]@{
-                ClientId          = $grant.ClientId
-                ClientDisplayName = $spName
-                ClientPublisher   = $spPublisher
-                ConsentType       = $grant.ConsentType
-                PrincipalId       = $grant.PrincipalId
-                ResourceId        = $grant.ResourceId
-                Scopes            = $grant.Scope
-                HighRiskScopes    = ($highRiskScopes -join "; ")
-                RiskLevel         = $riskLevel
-                ExpiryTime        = $grant.ExpiryTime
-            })
         }
         return $grantData.ToArray()
     }
@@ -689,6 +834,11 @@ function Get-MailboxRulesData {
 
     foreach ($mbx in $mbxArray) {
         $processed++
+        $pct = [math]::Round(($processed / $total) * 100)
+        Write-Progress -Activity "Analisi Inbox Rules & Forwarding" `
+            -Status "Mailbox $processed/$total : $($mbx.UPN)" `
+            -PercentComplete $pct
+
         if ($processed % 50 -eq 0) {
             Write-Log "  Progress Rules: $processed/$total mailbox analizzate..." "INFO"
         }
@@ -739,6 +889,7 @@ function Get-MailboxRulesData {
         }
     }
 
+    Write-Progress -Activity "Analisi Inbox Rules & Forwarding" -Completed
     Write-Log "Completato: Inbox Rules - $($rulesData.Count) regole, $($fwdData.Count) forward trovati." "SUCCESS"
     return @{
         Rules      = $rulesData.ToArray()
@@ -952,9 +1103,20 @@ function Export-DataToCSV {
         @{ Name = "Forwarding";         Data = $fwdArr }
     )
 
+    # CSV sempre generati anche se vuoti (garantisce presenza file per post-processing)
+    $alwaysExport = @("OAuth_Grants")
+
+    $csvIndex = 0
     foreach ($item in $csvMap) {
-        if ($item.Data -and @($item.Data).Count -gt 0) {
-            $csvPath = Join-Path $CsvDir "$($item.Name).csv"
+        $csvIndex++
+        $pct     = [math]::Round(($csvIndex / $csvMap.Count) * 100)
+        $csvPath = Join-Path $CsvDir "$($item.Name).csv"
+        Write-Progress -Activity "Export CSV" -Status "$($item.Name).csv" -PercentComplete $pct
+
+        $hasData = ($item.Data -and @($item.Data).Count -gt 0)
+        $mustExport = ($item.Name -in $alwaysExport)
+
+        if ($hasData) {
             try {
                 @($item.Data) | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
                 $count = @($item.Data).Count
@@ -963,10 +1125,22 @@ function Export-DataToCSV {
             } catch {
                 Write-Log "  Errore export CSV $($item.Name): $($_.Exception.Message)" "ERROR"
             }
+        } elseif ($mustExport) {
+            # Genera file vuoto con header placeholder per garantire la presenza del file
+            try {
+                [PSCustomObject]@{
+                    Nota = "Nessun dato raccolto - grant OAuth assenti o raccolta saltata per timeout/errore"
+                } | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+                Write-Log "  CSV: $($item.Name).csv (vuoto - file garantito)" "WARN"
+                $exported.Add($csvPath)
+            } catch {
+                Write-Log "  Errore export CSV vuoto $($item.Name): $($_.Exception.Message)" "ERROR"
+            }
         } else {
             Write-Log "  Skip CSV: $($item.Name) (nessun dato)" "WARN"
         }
     }
+    Write-Progress -Activity "Export CSV" -Completed
     return $exported.ToArray()
 }
 
@@ -1985,6 +2159,342 @@ function New-ExecutiveReport {
 
 #endregion
 
+#region ─── HTML REPORT ESECUTIVO ─────────────────────────────────────────────
+
+function New-HtmlReport {
+    <#
+    .SYNOPSIS
+        Genera un report HTML esecutivo in italiano per il security assessment M365.
+    .DESCRIPTION
+        Report visuale con score, rating, rischi principali e azioni prioritarie.
+        Non include dati sensibili estesi. Solo KPI e sommari aggregati.
+    #>
+    param(
+        [string]$HtmlPath,
+        $ScoreResult,
+        $MfaData,
+        $CaData,
+        $TransportData,
+        $RolesData,
+        $LegacyData,
+        $OAuthData,
+        $RulesData,
+        $CasData
+    )
+
+    Write-Progress -Activity "Generazione HTML Report" -Status "Calcolo metriche..." -PercentComplete 10
+
+    # ── Calcolo metriche ───────────────────────────────────────────────────────
+    if ($LegacyData) {
+        $legacyCount = @($LegacyData).Count
+    } else {
+        $legacyCount = 0
+    }
+    if ($OAuthData) {
+        $highRiskOAuth = @($OAuthData | Where-Object { $_.RiskLevel -eq "ALTO" }).Count
+    } else {
+        $highRiskOAuth = 0
+    }
+    if ($OAuthData) {
+        $totalOAuth = @($OAuthData).Count
+    } else {
+        $totalOAuth = 0
+    }
+    if ($RulesData -and $RulesData.ContainsKey("Forwarding") -and $RulesData["Forwarding"]) {
+        $riskyFwdCount = @($RulesData["Forwarding"]).Count
+    } else {
+        $riskyFwdCount = 0
+    }
+    if ($CaData) {
+        $enabledCa = @($CaData | Where-Object { $_.State -eq "enabled" }).Count
+    } else {
+        $enabledCa = 0
+    }
+    if ($CaData) {
+        $totalCa = @($CaData).Count
+    } else {
+        $totalCa = 0
+    }
+    $smtpOk = ($TransportData -and $TransportData.SmtpClientAuthenticationDisabled -eq $true)
+    if ($CasData) {
+        $popImapCount = @($CasData | Where-Object { $_.PopEnabled -eq $true -or $_.ImapEnabled -eq $true }).Count
+    } else {
+        $popImapCount = 0
+    }
+    if ($CasData) {
+        $casTotal = @($CasData).Count
+    } else {
+        $casTotal = 0
+    }
+    if ($MfaData) {
+        $adminSenzaMfa = @($MfaData | Where-Object { $_.IsAdmin -eq $true -and $_.IsMfaRegistered -ne $true }).Count
+    } else {
+        $adminSenzaMfa = 0
+    }
+
+    $dateStr    = Get-Date -Format "dd/MM/yyyy HH:mm"
+    $dateFile   = Get-Date -Format "dd MMMM yyyy"
+    $pct        = $ScoreResult.Percentage
+    $rating     = $ScoreResult.Rating
+    $score      = $ScoreResult.Score
+    $maxScore   = $ScoreResult.MaxScore
+    $mfaCov     = $ScoreResult.MfaStats.Coverage
+    $adminCount = $ScoreResult.AdminCount
+
+    # ── Colori del rating ─────────────────────────────────────────────────────
+    $ratingColor = switch ($rating) {
+        "BUONO"        { "#1a7a1a" }
+        "SUFFICIENTE"  { "#b38a00" }
+        "INSUFFICIENTE"{ "#cc4400" }
+        default        { "#a00000" }
+    }
+    $ratingBg = switch ($rating) {
+        "BUONO"        { "#d4edda" }
+        "SUFFICIENTE"  { "#fff3cd" }
+        "INSUFFICIENTE"{ "#ffe5d0" }
+        default        { "#f8d7da" }
+    }
+
+    # ── Helper: row per tabella rischi ────────────────────────────────────────
+    function New-RiskRow {
+        param([string]$Area, [string]$Status, [string]$Level, [string]$Detail)
+        $bg = switch ($Level) {
+            "CRITICO" { "#f8d7da" } "ALTO" { "#fff0d0" } "MEDIO" { "#fff3cd" }
+            "OK"      { "#d4edda" } default { "#e8f0fe" }
+        }
+        $badge = switch ($Level) {
+            "CRITICO" { "#a00000" } "ALTO" { "#cc4400" } "MEDIO" { "#b38a00" }
+            "OK"      { "#1a7a1a" } default { "#2c5282" }
+        }
+        return @"
+<tr style="background:$bg">
+  <td style="padding:8px 12px;font-weight:600">$Area</td>
+  <td style="padding:8px 12px">$Status</td>
+  <td style="padding:8px 12px;text-align:center">
+    <span style="background:$badge;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.78em;font-weight:700">$Level</span>
+  </td>
+  <td style="padding:8px 12px;color:#444;font-size:0.9em">$Detail</td>
+</tr>
+"@
+    }
+
+    Write-Progress -Activity "Generazione HTML Report" -Status "Composizione sezioni rischi..." -PercentComplete 40
+
+    # ── Righe rischi ──────────────────────────────────────────────────────────
+    if ($mfaCov -ge 90) {
+        $mfaLevel = "OK"
+    } elseif ($mfaCov -ge 70) {
+        $mfaLevel = "MEDIO"
+    } else {
+        $mfaLevel = "CRITICO"
+    }
+    if ($enabledCa -gt 0) {
+        $caLevel = "OK"
+    } else {
+        $caLevel = "CRITICO"
+    }
+    if ($smtpOk) {
+        $smtpLevel = "OK"
+    } else {
+        $smtpLevel = "ALTO"
+    }
+    if ($highRiskOAuth -eq 0) {
+        $oauthLevel = "OK"
+    } elseif ($highRiskOAuth -le 3) {
+        $oauthLevel = "MEDIO"
+    } else {
+        $oauthLevel = "ALTO"
+    }
+    if ($adminCount -le 5 -and $adminCount -ge 2) {
+        $adminLevel = "OK"
+    } elseif ($adminCount -gt 10) {
+        $adminLevel = "ALTO"
+    } else {
+        $adminLevel = "MEDIO"
+    }
+    if ($legacyCount -eq 0) {
+        $legacyLevel = "OK"
+    } elseif ($legacyCount -lt 10) {
+        $legacyLevel = "MEDIO"
+    } else {
+        $legacyLevel = "ALTO"
+    }
+    if ($riskyFwdCount -eq 0) {
+        $fwdLevel = "OK"
+    } else {
+        $fwdLevel = "ALTO"
+    }
+    if ($casTotal -eq 0 -or ($popImapCount / [math]::Max($casTotal, 1) * 100) -lt 5) {
+        $popLevel = "OK"
+    } else {
+        $popLevel = "MEDIO"
+    }
+
+    if ($smtpOk) {
+        $smtpDetail = "Disabilitato - configurazione sicura"
+        $smtpAuthStatus = "OFF"
+    } else {
+        $smtpDetail = "Abilitato - rischio credential spray"
+        $smtpAuthStatus = "ON"
+    }
+
+    $riskRows = (
+        (New-RiskRow "Autenticazione MFA" "$mfaCov% copertura ($($ScoreResult.MfaStats.Registered)/$($ScoreResult.MfaStats.Total) utenti)" $mfaLevel "Admin senza MFA: $adminSenzaMfa") +
+        (New-RiskRow "Conditional Access" "$enabledCa policy attive su $totalCa totali" $caLevel "Verificare policy per MFA e legacy auth") +
+        (New-RiskRow "SMTP Authentication" $smtpDetail $smtpLevel "") +
+        (New-RiskRow "OAuth Grants" "$highRiskOAuth ad alto rischio su $totalOAuth totali" $oauthLevel "Scope pericolosi: Mail.ReadWrite, Files.ReadWrite.All") +
+        (New-RiskRow "Global Administrators" "$adminCount Global Admin rilevati" $adminLevel "Ottimale: 2-5 amministratori") +
+        (New-RiskRow "Autenticazione Legacy" "$legacyCount eventi negli ultimi $LookbackDays giorni" $legacyLevel "") +
+        (New-RiskRow "Forwarding & Inbox Rules" "$riskyFwdCount forward attivi" $fwdLevel "Verificare autorizzazione") +
+        (New-RiskRow "POP3 / IMAP" "$popImapCount mailbox esposte su $casTotal" $popLevel "Disabilitare per mailbox non legacy")
+    )
+
+    # ── Score gauge (barra orizzontale CSS) ───────────────────────────────────
+    $gaugeColor = switch ($rating) {
+        "BUONO"        { "#1a7a1a" }
+        "SUFFICIENTE"  { "#b38a00" }
+        "INSUFFICIENTE"{ "#cc4400" }
+        default        { "#a00000" }
+    }
+
+    # ── Righe azioni prioritarie ──────────────────────────────────────────────
+    $actionRows = @"
+<tr style="background:#f8d7da"><td style="padding:8px 12px"><span style="background:#a00000;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.78em;font-weight:700">1 - CRITICA</span></td><td style="padding:8px 12px">MFA / CA Policy</td><td style="padding:8px 12px">Abilitare MFA per tutti gli utenti e creare policy CA obbligatoria</td><td style="padding:8px 12px;text-align:center">Immediato</td></tr>
+<tr style="background:#fff0d0"><td style="padding:8px 12px"><span style="background:#cc4400;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.78em;font-weight:700">2 - ALTA</span></td><td style="padding:8px 12px">Legacy Auth</td><td style="padding:8px 12px">Bloccare autenticazione legacy tramite Conditional Access</td><td style="padding:8px 12px;text-align:center">14 giorni</td></tr>
+<tr style="background:#fff0d0"><td style="padding:8px 12px"><span style="background:#cc4400;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.78em;font-weight:700">2 - ALTA</span></td><td style="padding:8px 12px">SMTP AUTH</td><td style="padding:8px 12px">Disabilitare SMTP AUTH globalmente in Exchange Online</td><td style="padding:8px 12px;text-align:center">30 giorni</td></tr>
+<tr style="background:#fff0d0"><td style="padding:8px 12px"><span style="background:#cc4400;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.78em;font-weight:700">2 - ALTA</span></td><td style="padding:8px 12px">OAuth</td><td style="padding:8px 12px">Revisionare e revocare grant OAuth con scope ad alto rischio</td><td style="padding:8px 12px;text-align:center">30 giorni</td></tr>
+<tr style="background:#fff3cd"><td style="padding:8px 12px"><span style="background:#b38a00;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.78em;font-weight:700">3 - MEDIA</span></td><td style="padding:8px 12px">Admin</td><td style="padding:8px 12px">Ridurre Global Admin, usare ruoli specifici e valutare PIM</td><td style="padding:8px 12px;text-align:center">60 giorni</td></tr>
+<tr style="background:#fff3cd"><td style="padding:8px 12px"><span style="background:#b38a00;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.78em;font-weight:700">3 - MEDIA</span></td><td style="padding:8px 12px">POP3 / IMAP</td><td style="padding:8px 12px">Disabilitare POP3 e IMAP per mailbox che non ne necessitano</td><td style="padding:8px 12px;text-align:center">60 giorni</td></tr>
+<tr style="background:#d4edda"><td style="padding:8px 12px"><span style="background:#1a7a1a;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.78em;font-weight:700">4 - BASSA</span></td><td style="padding:8px 12px">Monitoring</td><td style="padding:8px 12px">Configurare Microsoft Defender for Office 365 e alert SIEM</td><td style="padding:8px 12px;text-align:center">90 giorni</td></tr>
+"@
+
+    Write-Progress -Activity "Generazione HTML Report" -Status "Scrittura file HTML..." -PercentComplete 70
+
+    # ── Template HTML ─────────────────────────────────────────────────────────
+    $html = @"
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>M365 Security Assessment - $TenantName</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',Arial,sans-serif;background:#f0f4f8;color:#1a202c;font-size:15px}
+  .header{background:linear-gradient(135deg,#1F4E79 0%,#2E75B6 100%);color:#fff;padding:32px 40px}
+  .header h1{font-size:1.6em;font-weight:700;letter-spacing:.5px}
+  .header .sub{font-size:0.92em;margin-top:6px;opacity:.85}
+  .container{max-width:1100px;margin:0 auto;padding:28px 24px}
+  .card{background:#fff;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,.07);margin-bottom:24px;overflow:hidden}
+  .card-header{background:#1F4E79;color:#fff;padding:14px 20px;font-weight:700;font-size:1em;letter-spacing:.3px}
+  .card-body{padding:20px}
+  .score-box{display:flex;align-items:center;gap:32px;flex-wrap:wrap}
+  .score-circle{width:120px;height:120px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;background:$ratingBg;border:5px solid $ratingColor;flex-shrink:0}
+  .score-num{font-size:2em;font-weight:800;color:$ratingColor}
+  .score-label{font-size:0.7em;color:$ratingColor;font-weight:600;margin-top:2px}
+  .score-details{flex:1}
+  .score-details h2{font-size:1.5em;font-weight:700;color:$ratingColor}
+  .score-details .sub{color:#555;font-size:0.9em;margin-top:4px}
+  .gauge-wrap{margin-top:14px;background:#e2e8f0;border-radius:8px;height:16px;overflow:hidden}
+  .gauge-fill{height:100%;background:$gaugeColor;border-radius:8px;width:$pct%;transition:width .8s}
+  .gauge-lbl{font-size:0.78em;color:#666;margin-top:4px}
+  .kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px}
+  .kpi{background:#f8fafc;border-radius:8px;padding:16px;border-left:4px solid #2E75B6;text-align:center}
+  .kpi .val{font-size:2em;font-weight:800;color:#1F4E79}
+  .kpi .lbl{font-size:0.78em;color:#555;margin-top:4px}
+  table{width:100%;border-collapse:collapse;font-size:0.88em}
+  th{background:#1F4E79;color:#fff;padding:10px 12px;text-align:left;font-weight:600}
+  td{border-bottom:1px solid #e2e8f0;vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  .disclaimer{background:#fff8e1;border:1px solid #ffe082;border-radius:8px;padding:14px 18px;font-size:0.82em;color:#555;line-height:1.6}
+  .footer{text-align:center;color:#999;font-size:0.78em;padding:16px 0 32px}
+  @media(max-width:600px){.score-box{flex-direction:column}.kpi-grid{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>&#x1F6E1; Valutazione Sicurezza Microsoft 365</h1>
+  <div class="sub">Tenant: <strong>$TenantName</strong> &nbsp;|&nbsp; Data: $dateStr &nbsp;|&nbsp; Periodo analisi: $LookbackDays giorni &nbsp;|&nbsp; Versione script: v$($Script:AssessmentVersion)</div>
+</div>
+<div class="container">
+
+  <!-- SCORE -->
+  <div class="card">
+    <div class="card-header">&#x2B50; Security Score Complessivo</div>
+    <div class="card-body">
+      <div class="score-box">
+        <div class="score-circle">
+          <div class="score-num">$pct%</div>
+          <div class="score-label">$rating</div>
+        </div>
+        <div class="score-details">
+          <h2>$rating</h2>
+          <div class="sub">Punteggio: $score / $maxScore punti totali</div>
+          <div class="gauge-wrap"><div class="gauge-fill"></div></div>
+          <div class="gauge-lbl">$pct% del massimo raggiunto</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- KPI -->
+  <div class="card">
+    <div class="card-header">&#x1F4CA; KPI Chiave</div>
+    <div class="card-body">
+      <div class="kpi-grid">
+        <div class="kpi"><div class="val">$mfaCov%</div><div class="lbl">Copertura MFA</div></div>
+        <div class="kpi"><div class="val">$enabledCa</div><div class="lbl">Policy CA Attive</div></div>
+        <div class="kpi"><div class="val">$adminCount</div><div class="lbl">Global Administrators</div></div>
+        <div class="kpi"><div class="val">$highRiskOAuth</div><div class="lbl">OAuth Alto Rischio</div></div>
+        <div class="kpi"><div class="val">$legacyCount</div><div class="lbl">Eventi Legacy Auth</div></div>
+        <div class="kpi"><div class="val">$riskyFwdCount</div><div class="lbl">Forward Sospetti</div></div>
+        <div class="kpi"><div class="val">$smtpAuthStatus</div><div class="lbl">SMTP Auth Globale</div></div>
+        <div class="kpi"><div class="val">$adminSenzaMfa</div><div class="lbl">Admin senza MFA</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RISCHI -->
+  <div class="card">
+    <div class="card-header">&#x26A0; Rischi Principali</div>
+    <div class="card-body" style="padding:0">
+      <table>
+        <thead><tr><th>Area</th><th>Stato</th><th>Livello</th><th>Note</th></tr></thead>
+        <tbody>$riskRows</tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- AZIONI -->
+  <div class="card">
+    <div class="card-header">&#x1F3AF; Azioni Prioritarie Raccomandate</div>
+    <div class="card-body" style="padding:0">
+      <table>
+        <thead><tr><th>Priorita</th><th>Categoria</th><th>Azione</th><th>Scadenza</th></tr></thead>
+        <tbody>$actionRows</tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- DISCLAIMER -->
+  <div class="disclaimer">
+    <strong>&#x26A0; Dichiarazione di limitazione:</strong> Questo report e stato generato automaticamente da uno script read-only. I dati riflettono lo stato del tenant al momento dell'assessment (<em>$dateStr</em>). Nessuna modifica e stata apportata al tenant. Le raccomandazioni devono essere validate da un esperto di sicurezza prima dell'implementazione. Il report non contiene dati sensibili personali estesi.
+  </div>
+
+  <div class="footer">Report M365 Security Assessment v$($Script:AssessmentVersion) &bull; $TenantName &bull; $dateFile</div>
+</div>
+</body>
+</html>
+"@
+
+    $html | Set-Content -Path $HtmlPath -Encoding UTF8
+    Write-Progress -Activity "Generazione HTML Report" -Completed
+    Write-Log "HTML Report esecutivo salvato: $HtmlPath" "SUCCESS"
+    return $HtmlPath
+}
+
+#endregion
+
 #region ─── MAIN ───────────────────────────────────────────────────────────────
 
 function Main {
@@ -2004,29 +2514,46 @@ function Main {
     Write-Log "SkipExchange     : $SkipExchange" "INFO"
 
     try {
+        # ─ Fase 1: Moduli ──────────────────────────────────────────────────────
+        Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
+            -Status "Fase 1/7: Verifica moduli..." -PercentComplete 5
         Test-AndImportModules
 
+        # ─ Fase 2: Connessioni ─────────────────────────────────────────────────
+        Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
+            -Status "Fase 2/7: Connessione servizi..." -PercentComplete 12
         if (-not $SkipGraph)    { Connect-ToMicrosoftGraph }
         if (-not $SkipExchange) { Connect-ToExchangeOnline }
 
-        Write-Section "RACCOLTA DATI"
+        # ─ Fase 3: Raccolta Graph ──────────────────────────────────────────────
+        Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
+            -Status "Fase 3/7: Raccolta dati Microsoft Graph..." -PercentComplete 20
+        Write-Section "RACCOLTA DATI GRAPH"
 
-        # Graph
-        $mfaData            = if (-not $SkipGraph)    { Get-MFARegistrationData }     else { $null }
-        $caData             = if (-not $SkipGraph)    { Get-ConditionalAccessData }   else { $null }
-        $signInData         = if (-not $SkipGraph)    { Get-SignInLogsData -Days $LookbackDays } else { $null }
-        $legacyData         = if ($signInData)        { Get-LegacyAuthData -SignInLogs $signInData } else { $null }
-        $rolesData          = if (-not $SkipGraph)    { Get-DirectoryRolesData }      else { $null }
-        $oauthData          = if (-not $SkipGraph)    { Get-OAuthGrantsData }         else { $null }
-        $riskyUsersData     = if (-not $SkipGraph)    { Get-RiskyUsersData }          else { $null }
-        $riskDetectionsData = if (-not $SkipGraph)    { Get-RiskDetectionsData }      else { $null }
+        $mfaData            = if (-not $SkipGraph)    { Get-MFARegistrationData }              else { $null }
+        $caData             = if (-not $SkipGraph)    { Get-ConditionalAccessData }            else { $null }
+        $signInData         = if (-not $SkipGraph)    { Get-SignInLogsData -Days $LookbackDays }else { $null }
+        $legacyData         = if ($signInData)         { Get-LegacyAuthData -SignInLogs $signInData } else { $null }
+        $rolesData          = if (-not $SkipGraph)    { Get-DirectoryRolesData }               else { $null }
+        $oauthData          = if (-not $SkipGraph)    { Get-OAuthGrantsData }                  else { $null }
+        $riskyUsersData     = if (-not $SkipGraph)    { Get-RiskyUsersData }                   else { $null }
+        $riskDetectionsData = if (-not $SkipGraph)    { Get-RiskDetectionsData }               else { $null }
 
-        # Exchange
-        $transportData      = if (-not $SkipExchange) { Get-TransportConfigData }     else { $null }
-        $casData            = if (-not $SkipExchange) { Get-CASMailboxData }          else { $null }
-        $mailboxData        = if (-not $SkipExchange) { Get-MailboxData }             else { $null }
-        $rulesData          = if (-not $SkipExchange -and $mailboxData) { Get-MailboxRulesData -Mailboxes $mailboxData } else { $null }
+        # ─ Fase 4: Raccolta Exchange ───────────────────────────────────────────
+        Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
+            -Status "Fase 4/7: Raccolta dati Exchange Online..." -PercentComplete 45
+        Write-Section "RACCOLTA DATI EXCHANGE"
 
+        $transportData = if (-not $SkipExchange) { Get-TransportConfigData }  else { $null }
+        $casData       = if (-not $SkipExchange) { Get-CASMailboxData }       else { $null }
+        $mailboxData   = if (-not $SkipExchange) { Get-MailboxData }          else { $null }
+        $rulesData     = if (-not $SkipExchange -and $mailboxData) {
+            Get-MailboxRulesData -Mailboxes $mailboxData
+        } else { $null }
+
+        # ─ Fase 5: Score ───────────────────────────────────────────────────────
+        Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
+            -Status "Fase 5/7: Calcolo Security Score..." -PercentComplete 62
         Write-Section "CALCOLO SECURITY SCORE"
         $scoreResult = Get-SecurityScore `
             -TransportConfig $transportData `
@@ -2038,6 +2565,9 @@ function Main {
 
         Write-Log "Security Score: $($scoreResult.Score)/$($scoreResult.MaxScore) ($($scoreResult.Percentage)%) - $($scoreResult.Rating)" "SUCCESS"
 
+        # ─ Fase 6: Export CSV + Excel + Report ────────────────────────────────
+        Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
+            -Status "Fase 6/7: Export CSV..." -PercentComplete 68
         $csvFiles = Export-DataToCSV -CsvDir $csvDir `
             -MfaData            $mfaData `
             -CaData             $caData `
@@ -2052,9 +2582,11 @@ function Main {
             -RiskDetectionsData $riskDetectionsData `
             -RulesData          $rulesData
 
-        $dateStamp  = Get-Date -Format "yyyyMMdd"
-        $excelPath  = Join-Path $Script:OutputDir "M365_SecurityAssessment_${TenantName}_${dateStamp}.xlsx"
-        $excelFile  = New-ExcelWorkbook -ExcelPath $excelPath `
+        Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
+            -Status "Fase 6/7: Generazione Excel Workbook..." -PercentComplete 76
+        $dateStamp = Get-Date -Format "yyyyMMdd"
+        $excelPath = Join-Path $Script:OutputDir "M365_SecurityAssessment_${TenantName}_${dateStamp}.xlsx"
+        $excelFile = New-ExcelWorkbook -ExcelPath $excelPath `
             -ScoreResult        $scoreResult `
             -MfaData            $mfaData `
             -CaData             $caData `
@@ -2069,6 +2601,8 @@ function Main {
             -RiskDetectionsData $riskDetectionsData `
             -RulesData          $rulesData
 
+        Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
+            -Status "Fase 6/7: Generazione Report Markdown..." -PercentComplete 84
         $reportPath = Join-Path $Script:OutputDir "RapportoEsecutivo_${TenantName}_${dateStamp}.md"
         $reportFile = New-ExecutiveReport -ReportPath $reportPath `
             -ScoreResult  $scoreResult `
@@ -2080,6 +2614,23 @@ function Main {
             -OAuthData    $oauthData `
             -RulesData    $rulesData
 
+        Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
+            -Status "Fase 6/7: Generazione HTML Report esecutivo..." -PercentComplete 90
+        $htmlPath = Join-Path $Script:OutputDir "M365_SecurityAssessment_${TenantName}_${dateStamp}.html"
+        $htmlFile = New-HtmlReport -HtmlPath $htmlPath `
+            -ScoreResult  $scoreResult `
+            -MfaData      $mfaData `
+            -CaData       $caData `
+            -TransportData $transportData `
+            -RolesData    $rolesData `
+            -LegacyData   $legacyData `
+            -OAuthData    $oauthData `
+            -RulesData    $rulesData `
+            -CasData      $casData
+
+        # ─ Fase 7: Riepilogo ───────────────────────────────────────────────────
+        Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" `
+            -Status "Fase 7/7: Riepilogo finale..." -PercentComplete 97
         Write-Section "ASSESSMENT COMPLETATO"
         $duration = (Get-Date) - $Script:StartTime
         Write-Log "Durata totale: $([math]::Round($duration.TotalMinutes, 1)) minuti" "INFO"
@@ -2087,13 +2638,16 @@ function Main {
         Write-Log "SECURITY SCORE: $($scoreResult.Score)/$($scoreResult.MaxScore) ($($scoreResult.Percentage)%) - $($scoreResult.Rating)" "SUCCESS"
         Write-Log "" "INFO"
         Write-Log "FILE GENERATI:" "INFO"
-        Write-Log "  Excel Workbook  : $excelFile"   "SUCCESS"
-        Write-Log "  Report Esec.    : $reportFile"  "SUCCESS"
-        Write-Log "  CSV Directory   : $csvDir"      "SUCCESS"
-        Write-Log "  Log File        : $logPath"     "SUCCESS"
+        Write-Log "  Excel Workbook  : $excelFile"  "SUCCESS"
+        Write-Log "  HTML Report     : $htmlFile"   "SUCCESS"
+        Write-Log "  Report Esec. MD : $reportFile" "SUCCESS"
+        Write-Log "  CSV Directory   : $csvDir"     "SUCCESS"
+        Write-Log "  Log File        : $logPath"    "SUCCESS"
         Write-Log "" "INFO"
         Write-Log "CSV Files ($($csvFiles.Count)):" "INFO"
         foreach ($csv in $csvFiles) { Write-Log "  - $(Split-Path $csv -Leaf)" "INFO" }
+
+        Write-Progress -Activity "M365 Security Assessment v$Script:AssessmentVersion" -Completed
 
         [PSCustomObject]@{
             TenantName      = $TenantName
@@ -2101,6 +2655,7 @@ function Main {
             Percentage      = "$($scoreResult.Percentage)%"
             Rating          = $scoreResult.Rating
             ExcelReport     = $excelFile
+            HtmlReport      = $htmlFile
             ExecutiveReport = $reportFile
             CSVDirectory    = $csvDir
             LogFile         = $logPath
